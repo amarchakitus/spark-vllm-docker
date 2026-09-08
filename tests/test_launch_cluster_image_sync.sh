@@ -62,7 +62,7 @@ if [[ "${1:-}" == "image" && "${2:-}" == "inspect" ]]; then
     if [[ "${LOCAL_IMAGE_MISSING:-false}" == "true" ]]; then
         exit 1
     fi
-    echo "${LOCAL_IMAGE_ID:-sha256:head}"
+    echo "${LOCAL_IMAGE_ID:-sha256:head}|${LOCAL_IMAGE_CONTENT:-rootfs-A}"
     exit 0
 fi
 
@@ -82,7 +82,7 @@ if [[ "$*" == *"docker image inspect"* ]]; then
     if [[ "${REMOTE_IMAGE_MISSING:-false}" == "true" ]]; then
         exit 1
     fi
-    echo "${REMOTE_IMAGE_ID:-sha256:head}"
+    echo "${REMOTE_IMAGE_ID:-sha256:head}|${REMOTE_IMAGE_CONTENT:-rootfs-A}"
 fi
 
 exit 0
@@ -133,15 +133,15 @@ test_matching_images_launch_cluster() {
     setup_fixture
     REMOTE_IMAGE_ID="sha256:head" run_launch || fail "launch failed for matching image IDs"
     assert_output_contains 'Docker image consistency check passed\.'
-    assert_output_contains '\[WORKER\] 10\.0\.0\.2: sha256:head \(match\)'
+    assert_output_contains '\[WORKER\] 10\.0\.0\.2: sha256:head \(fingerprint [0-9a-f]{12}, match\)'
     assert_log_contains '^docker run '
     pass "matching image IDs allow cluster launch"
 }
 
 test_mismatched_image_aborts_before_launch() {
     setup_fixture
-    if REMOTE_IMAGE_ID="sha256:worker" run_launch; then
-        fail "launch unexpectedly succeeded for mismatched image IDs"
+    if REMOTE_IMAGE_ID="sha256:worker" REMOTE_IMAGE_CONTENT="rootfs-B" run_launch; then
+        fail "launch unexpectedly succeeded for mismatched image content"
     fi
     assert_output_contains 'Docker image mismatch on worker node \(10\.0\.0\.2\)'
     assert_output_contains 'Head:   sha256:head'
@@ -162,8 +162,24 @@ test_missing_worker_image_aborts_before_launch() {
     pass "missing worker image aborts before containers start"
 }
 
+# Regression: the head and worker daemons can use different image stores
+# (overlay2 reports the config digest, containerd reports the manifest digest),
+# so a byte-identical image legitimately has different .Id values per node. That
+# must not abort the launch.
+test_differing_ids_same_content_launch_cluster() {
+    setup_fixture
+    REMOTE_IMAGE_ID="sha256:worker" REMOTE_IMAGE_CONTENT="rootfs-A" run_launch \
+        || fail "launch failed for identical content reported under different image IDs"
+    assert_output_contains 'Docker image consistency check passed\.'
+    assert_output_contains '\[WORKER\] 10\.0\.0\.2: sha256:worker \(fingerprint [0-9a-f]{12}, match\)'
+    assert_output_contains 'image stores \(overlay2 vs containerd\)'
+    assert_log_contains '^docker run '
+    pass "differing image IDs with identical content allow cluster launch"
+}
+
 test_matching_images_launch_cluster
 test_mismatched_image_aborts_before_launch
 test_missing_worker_image_aborts_before_launch
+test_differing_ids_same_content_launch_cluster
 
 echo "All $TESTS_PASSED launch-cluster image consistency tests passed."

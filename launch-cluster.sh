@@ -1362,32 +1362,51 @@ verify_cluster_image_consistency() {
 
     echo "Verifying Docker image consistency across cluster nodes..."
 
-    local head_image_id
-    if ! head_image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE_NAME" 2>/dev/null) || [[ -z "$head_image_id" ]]; then
+    # Docker reports a different '{{.Id}}' depending on which image store the
+    # daemon uses: the classic overlay2 graph driver reports the image *config*
+    # digest while the containerd image store reports the *manifest* digest. Two
+    # nodes running different stores therefore never agree on .Id even when they
+    # hold a byte-identical image, so compare a store-agnostic fingerprint of the
+    # rootfs diff IDs plus the key config fields, which are read straight out of
+    # the image config and match under either store.
+    local inspect_format='{{.Id}}|{{.RootFS.Type}}|{{range .RootFS.Layers}}{{.}},{{end}}|{{json .Config}}'
+
+    local head_raw head_image_id head_fingerprint
+    if ! head_raw=$(docker image inspect --format "$inspect_format" "$IMAGE_NAME" 2>/dev/null) || [[ "$head_raw" != sha256:*\|?* ]]; then
         echo "Error: Could not inspect image '$IMAGE_NAME' on head node ($HEAD_IP)."
         echo "       Make sure the image exists and is accessible to the current user."
         return 1
     fi
-    echo "  [HEAD] $HEAD_IP: $head_image_id"
+    head_image_id="${head_raw%%|*}"
+    head_fingerprint=$(printf '%s' "${head_raw#*|}" | sha256sum | cut -d' ' -f1)
+    echo "  [HEAD] $HEAD_IP: $head_image_id (fingerprint ${head_fingerprint:0:12})"
 
     local inspect_cmd
-    printf -v inspect_cmd "docker image inspect --format '{{.Id}}' %q" "$IMAGE_NAME"
+    printf -v inspect_cmd "docker image inspect --format %q %q" "$inspect_format" "$IMAGE_NAME"
 
     local worker
-    local worker_image_id
+    local worker_raw worker_image_id worker_fingerprint
     local image_error=false
+    local store_hint=false
     for worker in "${PEER_NODES[@]}"; do
-        if ! worker_image_id=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "$inspect_cmd" 2>/dev/null) || [[ -z "$worker_image_id" ]]; then
+        if ! worker_raw=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "$inspect_cmd" 2>/dev/null) || [[ "$worker_raw" != sha256:*\|?* ]]; then
             echo "Error: Could not inspect image '$IMAGE_NAME' on worker node ($worker)."
             echo "       The image may be missing or inaccessible to the remote user."
             image_error=true
-        elif [[ "$worker_image_id" != "$head_image_id" ]]; then
+            continue
+        fi
+        worker_image_id="${worker_raw%%|*}"
+        worker_fingerprint=$(printf '%s' "${worker_raw#*|}" | sha256sum | cut -d' ' -f1)
+        if [[ "$worker_fingerprint" != "$head_fingerprint" ]]; then
             echo "Error: Docker image mismatch on worker node ($worker):"
-            echo "       Head:   $head_image_id"
-            echo "       Worker: $worker_image_id"
+            echo "       Head:   $head_image_id (fingerprint ${head_fingerprint:0:12})"
+            echo "       Worker: $worker_image_id (fingerprint ${worker_fingerprint:0:12})"
             image_error=true
         else
-            echo "  [WORKER] $worker: $worker_image_id (match)"
+            echo "  [WORKER] $worker: $worker_image_id (fingerprint ${worker_fingerprint:0:12}, match)"
+            if [[ "$worker_image_id" != "$head_image_id" ]]; then
+                store_hint=true
+            fi
         fi
     done
 
@@ -1395,6 +1414,11 @@ verify_cluster_image_consistency() {
         echo "Error: Cluster launch aborted because image '$IMAGE_NAME' is not in sync."
         printf "       Sync it with: ./build-and-copy.sh --no-build -t %q --copy-to <worker-hosts>\n" "$IMAGE_NAME"
         return 1
+    fi
+
+    if [[ "$store_hint" == "true" ]]; then
+        echo "  Note: image IDs differ across nodes because the daemons use different"
+        echo "        image stores (overlay2 vs containerd); the image content matches."
     fi
 
     echo "Docker image consistency check passed."
