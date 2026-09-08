@@ -243,10 +243,46 @@ prepare_local_vllm_source() {
     echo "Using clean local vLLM source at commit $VLLM_SOURCE_COMMIT."
 }
 
-get_remote_image_id() {
+# Docker reports a different '{{.Id}}' depending on which image store the daemon
+# uses: the classic overlay2 graph driver reports the image *config* digest while
+# the containerd image store reports the *manifest* digest. Two nodes running
+# different stores therefore never agree on .Id even when they hold a
+# byte-identical image, so compare a store-agnostic fingerprint instead. The
+# rootfs diff IDs and config fields below come straight out of the image config
+# and are identical under either store.
+IMAGE_INSPECT_FORMAT='{{.Id}}|{{.RootFS.Type}}|{{range .RootFS.Layers}}{{.}},{{end}}|{{json .Config}}'
+
+# Turns raw `docker image inspect` output into "<image id> <fingerprint>".
+# `docker image inspect` exits 0 even when the --format template fails to render,
+# so validate the shape here rather than trusting the exit status; otherwise a
+# broken template would hash empty output identically on every node and report a
+# false match.
+parse_image_inspect() {
+    local raw="$1"
+    case "$raw" in
+        sha256:*\|*) ;;
+        *) return 1 ;;
+    esac
+    local id="${raw%%|*}"
+    local material="${raw#*|}"
+    [ -n "$material" ] || return 1
+    printf '%s %s\n' "$id" "$(printf '%s' "$material" | sha256sum | cut -d' ' -f1)"
+}
+
+get_local_image_info() {
+    local image="$1"
+    local raw
+    raw=$(docker image inspect --format "$IMAGE_INSPECT_FORMAT" "$image" 2>/dev/null) || return 1
+    parse_image_inspect "$raw"
+}
+
+get_remote_image_info() {
     local host="$1"
     local image="$2"
-    ssh "${SSH_USER}@${host}" "docker image inspect --format '{{.Id}}' ${image}" 2>/dev/null
+    local cmd raw
+    printf -v cmd "docker image inspect --format %q %q" "$IMAGE_INSPECT_FORMAT" "$image"
+    raw=$(ssh "${SSH_USER}@${host}" "$cmd" 2>/dev/null) || return 1
+    parse_image_inspect "$raw"
 }
 
 copy_to_host() {
@@ -1369,18 +1405,20 @@ if [ "${#COPY_HOSTS[@]}" -gt 0 ]; then
     echo "Checking image '$IMAGE_TAG' on ${#COPY_HOSTS[@]} host(s): ${COPY_HOSTS[*]}"
     COPY_START=$(date +%s)
 
-    if ! LOCAL_IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$IMAGE_TAG"); then
+    if ! LOCAL_IMAGE_INFO=$(get_local_image_info "$IMAGE_TAG"); then
         echo "Error: Local image '$IMAGE_TAG' not found."
         exit 1
     fi
+    LOCAL_IMAGE_FINGERPRINT="${LOCAL_IMAGE_INFO##* }"
 
     COPY_TARGETS=()
     for host in "${COPY_HOSTS[@]}"; do
-        REMOTE_IMAGE_ID=$(get_remote_image_id "$host" "$IMAGE_TAG" || true)
-        if [ -n "$REMOTE_IMAGE_ID" ] && [ "$REMOTE_IMAGE_ID" = "$LOCAL_IMAGE_ID" ]; then
+        REMOTE_IMAGE_INFO=$(get_remote_image_info "$host" "$IMAGE_TAG" || true)
+        REMOTE_IMAGE_FINGERPRINT="${REMOTE_IMAGE_INFO##* }"
+        if [ -n "$REMOTE_IMAGE_INFO" ] && [ "$REMOTE_IMAGE_FINGERPRINT" = "$LOCAL_IMAGE_FINGERPRINT" ]; then
             echo "Image '$IMAGE_TAG' is already up to date on ${SSH_USER}@${host}; skipping."
         else
-            if [ -n "$REMOTE_IMAGE_ID" ]; then
+            if [ -n "$REMOTE_IMAGE_INFO" ]; then
                 echo "Image '$IMAGE_TAG' differs on ${SSH_USER}@${host}; will copy."
             else
                 echo "Image '$IMAGE_TAG' not found on ${SSH_USER}@${host}; will copy."

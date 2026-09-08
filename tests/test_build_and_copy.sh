@@ -112,7 +112,7 @@ if [ "${1:-}" = "build" ]; then
     )
 fi
 if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
-    echo "${LOCAL_IMAGE_ID:-sha256:local}"
+    echo "${LOCAL_IMAGE_ID:-sha256:local}|${LOCAL_IMAGE_CONTENT:-rootfs-A}"
     exit 0
 fi
 if [ "${1:-}" = "save" ]; then
@@ -141,11 +141,11 @@ cmd="${*:2}"
 if [[ "$cmd" == *"docker image inspect"* ]]; then
     case "$host" in
         samehost)
-            echo "${LOCAL_IMAGE_ID:-sha256:local}"
+            echo "${LOCAL_IMAGE_ID:-sha256:local}|${LOCAL_IMAGE_CONTENT:-rootfs-A}"
             exit 0
             ;;
         diffhost)
-            echo "sha256:remote"
+            echo "sha256:remote|rootfs-B"
             exit 0
             ;;
         *)
@@ -411,8 +411,8 @@ test_prebuilt_copy_parallel() {
 test_copy_skips_matching_remote_image() {
     setup_fixture
     run_build -c samehost || fail "matching remote copy run failed"
-    assert_log_contains '^docker image inspect --format \{\{\.Id\}\} vllm-node$'
-    assert_log_contains '^ssh .*@samehost docker image inspect --format '\''\{\{\.Id\}\}'\'' vllm-node$'
+    assert_log_contains '^docker image inspect --format \{\{\.Id\}\}\|.*\.RootFS\.Layers.* vllm-node$'
+    assert_log_contains '^ssh .*@samehost docker image inspect --format .*RootFS\.Layers.* vllm-node$'
     assert_log_not_contains '^docker save '
     assert_log_not_contains '^ssh .*@samehost docker load$'
     assert_output_contains "Image 'vllm-node' is already up to date on .*@samehost; skipping\."
